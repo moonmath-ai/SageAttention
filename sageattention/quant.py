@@ -166,10 +166,15 @@ def per_warp_int8(
     
     _tensor_layout = 0 if tensor_layout == "NHD" else 1
 
-    q_scale = torch.empty((b, h_qo, ((qo_len + BLKQ - 1) // BLKQ) * (BLKQ // WARPQ)), device=q.device, dtype=torch.float32)
-    k_scale = torch.empty((b, h_kv, (kv_len + BLKK - 1) // BLKK), device=q.device, dtype=torch.float32)
+    num_qb = (qo_len + BLKQ - 1) // BLKQ
+    num_qw = BLKQ // WARPQ
 
-    _fused.quant_per_warp_int8_cuda(q, q_int8, q_scale, BLKQ, WARPQ, _tensor_layout)
+    q_scale_block = torch.empty((b, h_qo, num_qb), device=q.device, dtype=torch.float32)
+    _fused.quant_per_block_int8_cuda(q, q_int8, q_scale_block, BLKQ, _tensor_layout)
+    q_scale = q_scale_block.repeat_interleave(num_qw, dim=2)
+
+    num_kb = (kv_len + BLKK - 1) // BLKK
+    k_scale = torch.empty((b, h_kv, num_kb), device=k.device, dtype=torch.float32)
 
     if km is not None:
         km = km.squeeze(1) if _tensor_layout == 0 else km.squeeze(2)

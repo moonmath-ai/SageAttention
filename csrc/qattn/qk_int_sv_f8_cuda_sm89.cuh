@@ -86,9 +86,6 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
 
-  // transfer to base 2 instead of base e with better numerical efficiency
-  sm_scale *= math::log2e;
-
   // RS holds the fragment of S
   int32_t RS[num_tiles_q][num_tiles_k][8];
   DTypeSVAccum RO[num_tiles_q][num_tiles_v][8];
@@ -251,10 +248,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
   float q_scale = Q_scale[q_scale_idx];
 
-  float original_sm_scale = sm_scale;
   float dequant_scale = q_scale * K_scale[k_scale_idx + 0 * k_scale_advance_offset];
-
-  sm_scale = original_sm_scale * dequant_scale;
 
   // load V
   // ! we assume that V is padded. If not, there might be illegal memory access or nan issue.
@@ -304,11 +298,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -332,7 +326,6 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + iter * k_scale_advance_offset];
-    sm_scale = original_sm_scale * dequant_scale;
     
     // ensure V is ready
     cp_async::wait_group<1>();
@@ -398,7 +391,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
         }
       }
     }
@@ -412,11 +405,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -440,7 +433,6 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
-    sm_scale = original_sm_scale * dequant_scale;
 
     // ensure V is ready
     cp_async::wait_group<1>();
@@ -505,7 +497,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
         }
       }
     }
@@ -519,11 +511,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, original_sm_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)

@@ -350,6 +350,56 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
   }
 }
 
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
+__device__ __forceinline__ void update_mdo_int(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
+{
+  // sm_scale_bits = __float_as_int(s);
+  // int log_scale = ((bits >> 23) & 0xFF) - 127;
+
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++) {
+      float m_prev = m[fq][k];
+      float m_temp = -5000000.0f;
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        float m_local = max(max(RS[fq][fk][k * 2 + 0], RS[fq][fk][k * 2 + 1]),
+                                max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+        m_temp = max(m_temp, m_local);
+      }
+
+      m_temp *= sm_scale;
+
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1)); // 0 exchange with 1, 2 exchange with 3
+      m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2)); // 0 exchange with 2, 1 exchange with 3
+
+      m[fq][k] = max(m[fq][k], m_temp);
+
+      float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
+
+      d[fq][k] *= o_scale;
+
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+        RO[fq][fv][k * 2 + 0] *= o_scale;
+        RO[fq][fv][k * 2 + 1] *= o_scale;
+        RO[fq][fv][k * 2 + 4] *= o_scale;
+        RO[fq][fv][k * 2 + 5] *= o_scale;
+      }
+
+      float negative_m = -m[fq][k];
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
+        RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
+        RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
+        RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
+      }
+    }
+  }
+}
+
 // for DTypeQKAccum float
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
 __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)

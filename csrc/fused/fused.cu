@@ -156,17 +156,21 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
     }
   }
 
-  __shared__ float s_amax;
+  __shared__ float s_scale;
   const float block_amax_val = vllm::blockReduceMax(amax_val);
   if (thread_id == 0)
   {
-    s_amax = block_amax_val;
-    scale_ptr_base[0] = s_amax / 127.0f;
+    float raw_scale = block_amax_val / 127.0f;
+    float lp = log2f(raw_scale);
+    float cp = ceilf(lp);
+    float pow2  = exp2f(cp);
+    s_scale = pow2;
+    scale_ptr_base[0] = pow2;
   }
 
   __syncthreads();
 
-  float tmp_scale = 127.0f / s_amax;
+  float tmp_scale = 1.0f / s_scale;
 
   char4 o_val[num_pack_per_thread][2];
 
@@ -754,7 +758,7 @@ void quant_per_warp_int8_cuda(
             nullptr,
             output.data_ptr<int8_t>(),
             reinterpret_cast<float*>(scale.data_ptr()),
-            0.0,
+            0.12751743082459868f, // TODO: tonyw -- set to log2(e) * 128**-0.5 (only valid for Q!)
             num_tokens,
             stride_bz_input, stride_seq_input, stride_h_input,
             0, 0,
