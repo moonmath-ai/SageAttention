@@ -170,7 +170,7 @@ def per_warp_int8(
     num_qw = BLKQ // WARPQ
 
     q_scale_block = torch.empty((b, h_qo, num_qb), device=q.device, dtype=torch.float32)
-    _fused.quant_per_block_int8_cuda(q, q_int8, q_scale_block, BLKQ, _tensor_layout)
+    _fused.quant_per_block_int8_cuda(q, q_int8, q_scale_block, 0.12751743082459868, BLKQ, _tensor_layout)
     q_scale = q_scale_block.repeat_interleave(num_qw, dim=2)
 
     num_kb = (kv_len + BLKK - 1) // BLKK
