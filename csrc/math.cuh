@@ -37,6 +37,23 @@ __forceinline__ __device__ half2 uint32_as_half2(uint32_t x) { return *(half2*)&
 __forceinline__ __device__ uint32_t half2_as_uint32(half2 x) { return *(uint32_t*)&x; }
 
 /*!
+ * \brief Compute (float)2^x for int32_t
+ * \param x input
+ */
+__forceinline__ __device__ float int_exp2(int32_t x) {
+  // flooring to -127
+  x = max(x, -127);
+  // Since -127 is bias of IEEE 754, we need to add 127 to get the correct exponent
+  x += 127;
+  // remove redundant bits
+  x &= 0xFF;
+  // shift to exponent position
+  x <<= 23;
+  // reinterpret as float
+  return __int2float_rz(x);
+}
+
+/*!
  * \brief Wrapper of PTX ex2.approx instruction, which computes 2^x
  * \param x input
  */

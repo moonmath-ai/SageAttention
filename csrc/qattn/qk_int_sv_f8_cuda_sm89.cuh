@@ -89,7 +89,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   // RS holds the fragment of S
   int32_t RS[num_tiles_q][num_tiles_k][8];
   DTypeSVAccum RO[num_tiles_q][num_tiles_v][8];
-  float m[num_tiles_q][2]; // max
+  int32_t m[num_tiles_q][2]; // max
   float d[num_tiles_q][2]; // denominator
 
   uint32_t q_scale_idx, k_scale_idx;
@@ -159,7 +159,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 #pragma unroll
     for (uint32_t k = 0; k < 2; k++)
     {
-      m[fq][k] = -5000000.0f;
+      m[fq][k] = -5000000;
       d[fq][k] = 1.0f;
     }
   }
@@ -280,29 +280,15 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     }
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-#pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
-        }
-      }
-    }
-
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -382,34 +368,20 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-#pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
-        }
-      }
-    }
-
     if constexpr (mask_mode == MaskMode::kCausal)
     {
-      apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
+      apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS);
     }
     // apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -488,34 +460,20 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     float RS_f32[num_tiles_q][num_tiles_k][8];
 
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-#pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
-        }
-      }
-    }
-
     if constexpr (mask_mode == MaskMode::kCausal)
     {
-      apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
+      apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS);
     }
-    apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
+    apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS, kv_len);
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS, RS_f32, RO, m, d, dequant_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -690,7 +648,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if (lse_idx < qo_len)
     {
-      lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + m[fq][k]);
+      lse_lane_ptr[0] = (math::ptx_log2(d[fq][k]) + (float)m[fq][k]);
     }
   }
 }
