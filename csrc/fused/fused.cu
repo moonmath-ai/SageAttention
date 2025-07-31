@@ -753,7 +753,7 @@ void quant_per_warp_int8_cuda(
 
           dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block>>>(
             reinterpret_cast<c_type*>(input.data_ptr()),
             nullptr,
             output.data_ptr<int8_t>(),
