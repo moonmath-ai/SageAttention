@@ -50,7 +50,7 @@ __forceinline__ __device__ float int_exp2(int32_t x) {
   // shift to exponent position
   x <<= 23;
   // reinterpret as float
-  return __int2float_rz(x);
+  return __int_as_float(x);
 }
 
 /*!
