@@ -363,6 +363,8 @@ __device__ __forceinline__ void update_mdo_int(int32_t RS[][num_tiles_k][8], flo
 {
   int sm_scale_bits = __float_as_int(sm_scale);
   int log_scale = ((sm_scale_bits >> 23) & 0xFF) - 127;
+  // log_scale is always negative
+  log_scale = -log_scale;
 
 #pragma unroll
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -377,13 +379,12 @@ __device__ __forceinline__ void update_mdo_int(int32_t RS[][num_tiles_k][8], flo
         m_temp = max(m_temp, m_local);
       }
 
-      m_temp = __reduce_max_sync(0xffffffff, m_temp);
-      m_temp <<= log_scale;
+      m_temp = max(m_temp, __reduce_max_sync(0xffffffff, m_temp));
+      m_temp >>= log_scale;
 
       m[fq][k] = max(m[fq][k], m_temp);
 
       float o_scale = math::int_exp2(m_prev - m[fq][k]);
-
       d[fq][k] *= o_scale;
 
 #pragma unroll
@@ -396,10 +397,10 @@ __device__ __forceinline__ void update_mdo_int(int32_t RS[][num_tiles_k][8], flo
 
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
-        RS_f32[fq][fk][k * 2 + 0] = math::int_exp2(RS[fq][fk][k * 2 + 0] << log_scale - m[fq][k]);
-        RS_f32[fq][fk][k * 2 + 1] = math::int_exp2(RS[fq][fk][k * 2 + 1] << log_scale - m[fq][k]);
-        RS_f32[fq][fk][k * 2 + 4] = math::int_exp2(RS[fq][fk][k * 2 + 4] << log_scale - m[fq][k]);
-        RS_f32[fq][fk][k * 2 + 5] = math::int_exp2(RS[fq][fk][k * 2 + 5] << log_scale - m[fq][k]);
+        RS_f32[fq][fk][k * 2 + 0] = math::int_exp2((RS[fq][fk][k * 2 + 0] >> log_scale) - m[fq][k]);
+        RS_f32[fq][fk][k * 2 + 1] = math::int_exp2((RS[fq][fk][k * 2 + 1] >> log_scale) - m[fq][k]);
+        RS_f32[fq][fk][k * 2 + 4] = math::int_exp2((RS[fq][fk][k * 2 + 4] >> log_scale) - m[fq][k]);
+        RS_f32[fq][fk][k * 2 + 5] = math::int_exp2((RS[fq][fk][k * 2 + 5] >> log_scale) - m[fq][k]);
       }
     }
   }
