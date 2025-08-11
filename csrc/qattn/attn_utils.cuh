@@ -24,6 +24,24 @@
 #include "../mma.cuh"
 #include "../permuted_smem.cuh"
 #include "../numeric_conversion.cuh"
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+template <int TileSize>
+__device__ __forceinline__ float warp_group_max(float value)
+{
+  cg::thread_block tb = cg::this_thread_block();
+  auto group = cg::tiled_partition<TileSize>(tb);
+  float x = value;
+  for (int offset = group.size() / 2; offset > 0; offset >>= 1)
+  {
+    float y = cg::shfl_down(group, x, offset);
+    x = fmaxf(x, y);
+  }
+  x = cg::shfl(group, x, 0);
+  return x;
+}
 
 #define WARP_SIZE 32
 
@@ -394,63 +412,68 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
 
       m[fq][k] = max(m[fq][k], m_temp);
 
-      float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
+      bool do_pv = warp_group_max<128>(m_temp - m[fq][k]) > -8.0f;
 
-      // update denominator
-      d[fq][k] *= o_scale;
-
-      half2 o_scale2;
-      if constexpr (use_half_o_scale)
-      {  
-        o_scale2 = __floats2half2_rn(o_scale, o_scale);
-      }
-
-      // update RO
-#pragma unroll
-      for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+      if (do_pv)
       {
-        if constexpr (std::is_same<DTypeSVAccum, float>::value)
-        {
-          RO[fq][fv][k * 2 + 0] *= o_scale;
-          RO[fq][fv][k * 2 + 1] *= o_scale;
-          RO[fq][fv][k * 2 + 4] *= o_scale;
-          RO[fq][fv][k * 2 + 5] *= o_scale;
+        float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
+
+        // update denominator
+        d[fq][k] *= o_scale;
+
+        half2 o_scale2;
+        if constexpr (use_half_o_scale)
+        {  
+          o_scale2 = __floats2half2_rn(o_scale, o_scale);
         }
-        else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+
+        // update RO
+#pragma unroll
+        for (uint32_t fv = 0; fv < num_tiles_v; fv++)
         {
-          if constexpr (use_half_o_scale)
+          if constexpr (std::is_same<DTypeSVAccum, float>::value)
           {
-            ((half2*)RO[fq][fv])[k] = __hmul2(((half2*)RO[fq][fv])[k], o_scale2);
-            ((half2*)RO[fq][fv])[k + 2] = __hmul2(((half2*)RO[fq][fv])[k + 2], o_scale2);
+            RO[fq][fv][k * 2 + 0] *= o_scale;
+            RO[fq][fv][k * 2 + 1] *= o_scale;
+            RO[fq][fv][k * 2 + 4] *= o_scale;
+            RO[fq][fv][k * 2 + 5] *= o_scale;
+          }
+          else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+          {
+            if constexpr (use_half_o_scale)
+            {
+              ((half2*)RO[fq][fv])[k] = __hmul2(((half2*)RO[fq][fv])[k], o_scale2);
+              ((half2*)RO[fq][fv])[k + 2] = __hmul2(((half2*)RO[fq][fv])[k + 2], o_scale2);
+            }
+            else
+            {
+              RO[fq][fv][k * 2 + 0] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 0]) * o_scale);
+              RO[fq][fv][k * 2 + 1] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 1]) * o_scale);
+              RO[fq][fv][k * 2 + 4] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 4]) * o_scale);
+              RO[fq][fv][k * 2 + 5] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 5]) * o_scale);
+            }
+          }
+        }
+
+        // raise RS to exponent
+        float negative_m = -m[fq][k];
+#pragma unroll
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+        {
+          if constexpr (fuse_scale)
+          {
+            RS[fq][fk][k * 2 + 0] = math::ptx_exp2(RS[fq][fk][k * 2 + 0] + negative_m);
+            RS[fq][fk][k * 2 + 1] = math::ptx_exp2(RS[fq][fk][k * 2 + 1] + negative_m);
+            RS[fq][fk][k * 2 + 4] = math::ptx_exp2(RS[fq][fk][k * 2 + 4] + negative_m);
+            RS[fq][fk][k * 2 + 5] = math::ptx_exp2(RS[fq][fk][k * 2 + 5] + negative_m);
           }
           else
           {
-            RO[fq][fv][k * 2 + 0] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 0]) * o_scale);
-            RO[fq][fv][k * 2 + 1] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 1]) * o_scale);
-            RO[fq][fv][k * 2 + 4] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 4]) * o_scale);
-            RO[fq][fv][k * 2 + 5] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 5]) * o_scale);
+            RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
           }
-        }
-      }
-
-      // raise RS to exponent
-      float negative_m = -m[fq][k];
-#pragma unroll
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-        if constexpr (fuse_scale)
-        {
-          RS[fq][fk][k * 2 + 0] = math::ptx_exp2(RS[fq][fk][k * 2 + 0] + negative_m);
-          RS[fq][fk][k * 2 + 1] = math::ptx_exp2(RS[fq][fk][k * 2 + 1] + negative_m);
-          RS[fq][fk][k * 2 + 4] = math::ptx_exp2(RS[fq][fk][k * 2 + 4] + negative_m);
-          RS[fq][fk][k * 2 + 5] = math::ptx_exp2(RS[fq][fk][k * 2 + 5] + negative_m);
-        }
-        else
-        {
-          RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
-          RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
         }
       }
     }
