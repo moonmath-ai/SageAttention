@@ -24,33 +24,65 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
-                    ):
-    lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        k_mask = offs_n[None, :] < (kv_len - start_n)   
-        k = tl.load(K_ptrs, mask = k_mask)
-        k_scale = tl.load(K_scale_ptr)
-        qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale 
-        m_ij = tl.maximum(m_i, tl.max(qk, 1))
-        qk = qk - m_ij[:, None]
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
+                    t=None):
+    log = 0
+    nof_kv_tiles = tl.cdiv(kv_len, BLOCK_N)
+    qk_ratio = BLOCK_M // BLOCK_N
+    j_bias = start_m * qk_ratio
+    pv_thr = -8 if t < 20 else -6 if t < 35 else -4
+    for j_ in range(nof_kv_tiles):
+        # # linear indexing
+        # j = j_
+
+        # # linear indexing starting at diag
+        # j = (j_ + j_bias) % nof_kv_tiles
+
+        # # radial indexing - starts at diag and alternates around it
+        # sign = 2 * (j_ % 2) - 1
+        # mag = (j_ + 1) // 2
+        # j_wo_bias = sign * mag
+        # j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+
+        # radial indexing with sink
+        if j_bias == 0:
+            sign = 2 * (j_ % 2) - 1
+            mag = (j_ + 1) // 2
+            j_wo_bias = sign * mag
+            j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+        else:
+            if j_ < qk_ratio:
+                j = j_
+            else:
+                sign = 2 * (j_ % 2) - 1
+                mag = (j_ - qk_ratio + 1) // 2
+                j_wo_bias = sign * mag
+                j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
+
+        kv_start = j * BLOCK_N
+        kv_stop = kv_len - kv_start
+        k_scale = tl.load(K_scale_ptr + j)
+        k = tl.load(K_ptrs + kv_start * stride_kn, mask = offs_n[None, :] < kv_stop)
+        qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
         
-        alpha = tl.math.exp2(m_i - m_ij)
-        l_i = l_i * alpha + l_ij
+        m_local = tl.max(qk, 1)
+        m_ij = tl.maximum(m_i, m_local)
+        do_pv = tl.max(m_local - m_ij) > pv_thr  # current p is far from zero (sparge condition)
+        log += 1 - do_pv
+
+        if do_pv:
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            l_ij = tl.sum(p, 1)
         
-        acc = acc * alpha[:, None]
-        
-        v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
-        p = p.to(tl.float16)
-        
-        acc += tl.dot(p, v, out_dtype=tl.float16)   
-        m_i = m_ij
-        K_ptrs += BLOCK_N * stride_kn
-        K_scale_ptr += 1
-        V_ptrs += BLOCK_N * stride_vn
-    return acc, l_i, m_i
+            alpha = tl.math.exp2(m_i - m_ij)
+            m_i = m_ij
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+
+            p = p.to(tl.float16)
+            v = tl.load(V_ptrs + kv_start * stride_vn, mask = offs_n[:, None] < kv_stop)
+            acc += tl.dot(p, v, out_dtype=tl.float16)  
+    return acc, l_i, m_i, log
 
 @triton.jit
 def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse, 
@@ -64,7 +96,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               BLOCK_N: tl.constexpr,  
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
-              ):
+              log, t=None):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -89,20 +121,25 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
+    acc, l_i, m_i, log_inner = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                     start_m,  
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
+                                    4 - STAGE, offs_m, offs_n,
+                                    t=t 
                                     )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+
+    tl.store(log + start_m, log_inner)
 
     if RETURN_LSE:
         lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False):
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, t=None):
+    log = torch.zeros(256, dtype=torch.int32, device='cuda')
+
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -148,6 +185,34 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
         STAGE=stage, RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4)
-    
+        num_stages=3 if head_dim == 64 else 4,
+        log=log, t=t)
+
+    print(f'{int(100*log.sum() / (kv_len / BLOCK_N) / (qo_len / BLOCK_M))}%', end=',')
     return o, lse
+
+if __name__ == "__main__":
+    print("hello world")
+    kv_len = 32760
+    BLOCK_M = 128
+    BLOCK_N = 64
+    nof_kv_tiles = kv_len // BLOCK_N + 1
+    qk_ratio = BLOCK_M // BLOCK_N
+    j_bias = 2 * qk_ratio
+    for j_ in range(nof_kv_tiles):
+        # radial indexing with sink
+        if j_bias == 0:
+            sign = 2 * (j_ % 2) - 1
+            mag = (j_ + 1) // 2
+            j_wo_bias = sign * mag
+            j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+        else:
+            if j_ < qk_ratio:
+                j = j_
+                j_wo_bias = 0
+            else:
+                sign = 2 * (j_ % 2) - 1
+                mag = (j_ - qk_ratio + 1) // 2
+                j_wo_bias = sign * mag
+                j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
+        print(f'{j_} -> {j} ({j_wo_bias})')

@@ -81,6 +81,7 @@ def sageattn(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    t=None,
     **kwargs: Any,
 ):
     """
@@ -136,7 +137,7 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-        
+    return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, t=t)
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
@@ -162,6 +163,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     sm_scale: Optional[float] = None, 
     smooth_k: bool = True,
     return_lse: bool = False,
+    t=None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -285,7 +287,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     if is_causal:
         o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
     else:
-        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, t=t)
 
     o = o[..., :head_dim_og]
 
