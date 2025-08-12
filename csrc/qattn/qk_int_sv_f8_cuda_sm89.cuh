@@ -52,6 +52,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
                       const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
                       float sm_scale)
 {
+  bool init = false;
   // compile time check
   static_assert(DTypeQK == DataType::kInt8 || DTypeQK == DataType::kInt4, "DTypeQK must be int8 or int4");
   static_assert(Q_GRAN == QuantGranularity::kPerBlock || Q_GRAN == QuantGranularity::kPerWarp || Q_GRAN == QuantGranularity::kPerThread, "Q_GRAN must be kPerBlock, kPerWarp or kPerThread");
@@ -298,11 +299,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -405,11 +406,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -511,11 +512,11 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale);
+      update_mdo_int<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, dequant_scale, init);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)

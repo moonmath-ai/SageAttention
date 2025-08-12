@@ -25,6 +25,7 @@ from .triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
 from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
 
 from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
+from .triton.kernel_skip_max import forward as attn_smooth_q
 
 try:
     from . import _qattn_sm80
@@ -72,6 +73,31 @@ def get_cuda_arch_versions():
         major, minor = torch.cuda.get_device_capability(i)
         cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
+
+
+def skip_max_attention(q, k, v, smooth_k=True, smooth_q=True):
+    BLOCK_M=128
+    if smooth_k:
+        k -= k.mean(dim=-2, keepdim=True)  
+    if smooth_q:
+        qgroups = q.split(BLOCK_M, dim=-2)
+        qm_list = []
+        qlist = []
+        for qgroup in qgroups:
+            qm_group = qgroup.mean(dim=-2, keepdim=True)
+            qgroup = qgroup - qm_group
+            qm_list.append(qm_group)
+            qlist.append(qgroup)
+        qm = torch.cat(qm_list, dim=-2)
+        q = torch.cat(qlist, dim=-2)
+        delta_s = torch.matmul(qm.float(), k.transpose(-2, -1).float()).contiguous()
+    else:
+        delta_s = torch.zeros((q.shape[0], q.shape[1], (q.shape[2]+1)//BLOCK_M, k.shape[2]), device=q.device, dtype=torch.float32)
+
+
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k)
+
+    return attn_smooth_q(q_int8, k_int8, v, delta_s, q_scale, k_scale)
 
 def sageattn(
     q: torch.Tensor,
@@ -138,6 +164,7 @@ def sageattn(
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
+    return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse)
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
@@ -285,7 +312,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     if is_causal:
         o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
     else:
-        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        o = skip_max_attention(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
 
     o = o[..., :head_dim_og]
 
