@@ -19,11 +19,51 @@
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cub/cub.cuh>
+namespace cg = cooperative_groups;
 
 #include "../cp_async.cuh"
 #include "../mma.cuh"
 #include "../permuted_smem.cuh"
 #include "../numeric_conversion.cuh"
+
+
+__device__ inline float warp_max(float v, unsigned mask = 0xffffffffu) {
+  v = fmaxf(v, __shfl_xor_sync(mask, v, 16));
+  v = fmaxf(v, __shfl_xor_sync(mask, v,  8));
+  v = fmaxf(v, __shfl_xor_sync(mask, v,  4));
+  v = fmaxf(v, __shfl_xor_sync(mask, v,  2));
+  v = fmaxf(v, __shfl_xor_sync(mask, v,  1));
+  return v;
+}
+
+__device__ inline float warpgroup128_max(float v) {
+  __shared__ float smem_base_per_tile[4];
+  auto block   = cg::this_thread_block();
+  auto tile128 = cg::tiled_partition<128>(block);
+
+  int t_rank = tile128.thread_rank();
+  int lane   = t_rank & 31;
+  int warp   = t_rank >> 5;
+
+  unsigned mask = __activemask();
+  float wmax = warp_max(v, mask);
+
+  if (lane == 0) smem_base_per_tile[warp] = wmax;
+  tile128.sync();
+
+  if (warp == 0) {
+    float x = (lane < 4) ? smem_base_per_tile[lane] : -5000000.0f;
+    float g = warp_max(x, __activemask());
+    if (lane == 0) smem_base_per_tile[0] = g;
+  }
+  tile128.sync();
+
+  return smem_base_per_tile[0];
+}
+
 
 #define WARP_SIZE 32
 
@@ -358,7 +398,6 @@ __device__ __forceinline__ bool update_mdo_sm89(float RS[][num_tiles_k][8], DTyp
   static_assert(num_tiles_q == 2);
   static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
 
-  bool do_pv[num_tiles_q][2];
   float m_temp[num_tiles_q][2] = {{-5000000.0f, -5000000.0f}, {-5000000.0f, -5000000.0f}};
 #pragma unroll
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
@@ -384,13 +423,20 @@ __device__ __forceinline__ bool update_mdo_sm89(float RS[][num_tiles_k][8], DTyp
       // exchange element with the 4 threads in the row
       m_temp[fq][k] = max(m_temp[fq][k], __shfl_xor_sync(0xffffffff, m_temp[fq][k], 0x1)); // 0 exchange with 1, 2 exchange with 3
       m_temp[fq][k] = max(m_temp[fq][k], __shfl_xor_sync(0xffffffff, m_temp[fq][k], 0x2)); // 0 exchange with 2, 1 exchange with 3
-
-      do_pv[fq][k] = true;
     }
   }
-  bool do_pv_or = do_pv[0][0] || do_pv[0][1] || do_pv[1][0] || do_pv[1][1];
+  float m_max = max(
+    max(m_temp[0][0] - m[0][0], m_temp[0][1] - m[0][1]),
+    max(m_temp[1][0] - m[1][0], m_temp[1][1] - m[1][1])
+  );
 
-  if (do_pv_or) {
+  m_max = warp_max(m_max);
+  bool do_pv = m_max > -4.0f;
+  // if (!do_pv) {
+  //   printf("blockIdx.x: %d, blockIdx.y: %d, blockIdx.z: %d, threadIdx.x: %d, threadIdx.y: %d, m_max: %f\n", blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, m_max);
+  // }
+
+  if (do_pv) {
 #pragma unroll
     for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
@@ -460,7 +506,7 @@ __device__ __forceinline__ bool update_mdo_sm89(float RS[][num_tiles_k][8], DTyp
       }
     }
   }
-  return do_pv_or;
+  return do_pv;
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>

@@ -312,17 +312,19 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
       do_pv = update_mdo_sm89<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
     }
 
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
-    {
-      accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
-    }
-
     uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
-    RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+    if (do_pv) {
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
+      {
+        accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
+      }
 
-    if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
-    {
-      accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+      RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+
+      if constexpr (DenominatorAccumUnit == ComputeUnit::kTensorCore)
+      {
+        accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+      }
     }
 
     __syncthreads();
@@ -359,8 +361,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
             smem_V, RS_f8, RO, d);   
         }
       }
-      __syncthreads();
     }
+    __syncthreads();
     // load V
     // for fp16: 
     // load_global_to_share                stride_seq_v
