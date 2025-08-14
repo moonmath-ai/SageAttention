@@ -65,7 +65,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
-  constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
+  constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M; // 32 / 16
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
   constexpr uint32_t num_tiles_qk_inner = (DTypeQK == DataType::kInt8) ? (head_dim / MMA_QK_K) : (head_dim / 2 / MMA_QK_K);
   constexpr uint32_t num_tiles_v = head_dim / MMA_SV_N;
@@ -302,13 +302,14 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     K_idx_lane_base += CTA_K;
 
+    bool do_pv;
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
+      do_pv = update_mdo_sm89<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
-      update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
+      do_pv = update_mdo_sm89<num_tiles_q, num_tiles_k, num_tiles_v, true, true, false>(RS_f32, RO, m, d, sm_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -338,26 +339,28 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     cp_async::wait_group<1>();
     __syncthreads();
 
-    // for fp16:
-    // compute_fp16_sv_permuted<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
-    //   smem_V, RS_f16, RO, d, V_smem_offset_mma);
-    if constexpr (!use_inst_buffer)
-    {
-      compute_fp8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-        smem_V, RS_f8, RO, d);
-    }
-    else
-    {
-      if constexpr (!use_pv_fp16_accu){
-        compute_fp8_sv_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-          smem_V, RS_f8, RO, d);   
+    if (do_pv) {
+      // for fp16:
+      // compute_fp16_sv_permuted<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, 4>(
+      //   smem_V, RS_f16, RO, d, V_smem_offset_mma);
+      if constexpr (!use_inst_buffer)
+      {
+        compute_fp8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+          smem_V, RS_f8, RO, d);
       }
-      else{
-        compute_fp8_sv_inst_buf_fp16_accu<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
-          smem_V, RS_f8, RO, d);   
+      else
+      {
+        if constexpr (!use_pv_fp16_accu){
+          compute_fp8_sv_inst_buf<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+            smem_V, RS_f8, RO, d);   
+        }
+        else{
+          compute_fp8_sv_inst_buf_fp16_accu<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V>(
+            smem_V, RS_f8, RO, d);   
+        }
       }
+      __syncthreads();
     }
-    __syncthreads();
     // load V
     // for fp16: 
     // load_global_to_share                stride_seq_v
