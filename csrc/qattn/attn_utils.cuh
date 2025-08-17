@@ -29,39 +29,48 @@ namespace cg = cooperative_groups;
 #include "../permuted_smem.cuh"
 #include "../numeric_conversion.cuh"
 
-
-__device__ inline float warp_max(float v, unsigned mask = 0xffffffffu) {
-  v = fmaxf(v, __shfl_xor_sync(mask, v, 16));
-  v = fmaxf(v, __shfl_xor_sync(mask, v,  8));
-  v = fmaxf(v, __shfl_xor_sync(mask, v,  4));
-  v = fmaxf(v, __shfl_xor_sync(mask, v,  2));
-  v = fmaxf(v, __shfl_xor_sync(mask, v,  1));
+__device__ inline float warp_max(float v) {
+  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
+  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  8));
+  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  4));
+  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  2));
+  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  1));
   return v;
 }
 
-__device__ inline float warpgroup128_max(float v) {
-  __shared__ float smem_base_per_tile[4];
-  auto block   = cg::this_thread_block();
-  auto tile128 = cg::tiled_partition<128>(block);
+__device__ inline bool warpgroup_do_pv(float v) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
 
-  int t_rank = tile128.thread_rank();
-  int lane   = t_rank & 31;
-  int warp   = t_rank >> 5;
+  float wmax = warp_max(v);
 
-  unsigned mask = __activemask();
-  float wmax = warp_max(v, mask);
-
-  if (lane == 0) smem_base_per_tile[warp] = wmax;
-  tile128.sync();
-
-  if (warp == 0) {
-    float x = (lane < 4) ? smem_base_per_tile[lane] : -5000000.0f;
-    float g = warp_max(x, __activemask());
-    if (lane == 0) smem_base_per_tile[0] = g;
+  __shared__ bool do_pv[4];
+  if (lane == 0) {
+    do_pv[warp] = wmax > -7.0f;
   }
-  tile128.sync();
+  __syncthreads();
 
-  return smem_base_per_tile[0];
+  return do_pv[0] || do_pv[1] || do_pv[2] || do_pv[3];
+}
+
+__device__ inline float warpgroup128_max(float v) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+
+  float wmax = warp_max(v);
+
+  __shared__ float smem[4];
+  if (lane == 0) {
+    smem[warp] = wmax;
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane == 0) {
+    smem[0] = max(max(smem[0], smem[1]), max(smem[2], smem[3]));
+  }
+  __syncthreads();
+
+  return smem[0];
 }
 
 
@@ -390,6 +399,114 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
   }
 }
 
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
+__device__ __forceinline__ bool update_mdo_sm90(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
+{
+  static_assert(num_tiles_q == 1);
+  static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
+
+  float m_temp[2] = {-5000000.0f, -5000000.0f};
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+    for (uint32_t k = 0; k < 2; k++) {
+#pragma unroll
+      for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+        float m_local = max(max(RS[fq][fk][k * 2 + 0], RS[fq][fk][k * 2 + 1]),
+                                max(RS[fq][fk][k * 2 + 4], RS[fq][fk][k * 2 + 5]));
+        m_temp[k] = max(m_temp[k], m_local);
+      }
+
+      if constexpr (!fuse_scale) {
+        if constexpr (exp_offset) {
+          m_temp[k] = fmaf(m_temp[k], sm_scale, -S_FP8_OFFSET);
+        } else {
+          m_temp[k] *= sm_scale;
+        }
+      } else if constexpr (exp_offset) {
+        m_temp[k] += (-S_FP8_OFFSET);
+      }
+
+      // exchange element with the 4 threads in the row
+      m_temp[k] = max(m_temp[k], __shfl_xor_sync(0xffffffff, m_temp[k], 0x1)); // 0 exchange with 1, 2 exchange with 3
+      m_temp[k] = max(m_temp[k], __shfl_xor_sync(0xffffffff, m_temp[k], 0x2)); // 0 exchange with 2, 1 exchange with 3
+    }
+  }
+  float m_max = max(m_temp[0] - m[0][0], m_temp[1] - m[0][1]);
+  bool do_pv = warpgroup_do_pv(m_max);
+
+  if (do_pv) {
+#pragma unroll
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+      for (uint32_t k = 0; k < 2; k++) {
+        float m_prev = m[fq][k];
+        m[fq][k] = max(m[fq][k], m_temp[k]);
+
+        float o_scale = math::ptx_exp2(m_prev - m[fq][k]);
+
+        // update denominator
+        d[fq][k] *= o_scale;
+
+        half2 o_scale2;
+        if constexpr (use_half_o_scale)
+        {  
+          o_scale2 = __floats2half2_rn(o_scale, o_scale);
+        }
+
+        // update RO
+  #pragma unroll
+        for (uint32_t fv = 0; fv < num_tiles_v; fv++)
+        {
+          if constexpr (std::is_same<DTypeSVAccum, float>::value)
+          {
+            RO[fq][fv][k * 2 + 0] *= o_scale;
+            RO[fq][fv][k * 2 + 1] *= o_scale;
+            RO[fq][fv][k * 2 + 4] *= o_scale;
+            RO[fq][fv][k * 2 + 5] *= o_scale;
+          }
+          else if constexpr (std::is_same<DTypeSVAccum, half>::value)
+          {
+            if constexpr (use_half_o_scale)
+            {
+              ((half2*)RO[fq][fv])[k] = __hmul2(((half2*)RO[fq][fv])[k], o_scale2);
+              ((half2*)RO[fq][fv])[k + 2] = __hmul2(((half2*)RO[fq][fv])[k + 2], o_scale2);
+            }
+            else
+            {
+              RO[fq][fv][k * 2 + 0] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 0]) * o_scale);
+              RO[fq][fv][k * 2 + 1] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 1]) * o_scale);
+              RO[fq][fv][k * 2 + 4] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 4]) * o_scale);
+              RO[fq][fv][k * 2 + 5] = __float2half_rn(__half2float(RO[fq][fv][k * 2 + 5]) * o_scale);
+            }
+          }
+        }
+
+        // raise RS to exponent
+        float negative_m = -m[fq][k];
+  #pragma unroll
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++)
+        {
+          if constexpr (fuse_scale)
+          {
+            RS[fq][fk][k * 2 + 0] = math::ptx_exp2(RS[fq][fk][k * 2 + 0] + negative_m);
+            RS[fq][fk][k * 2 + 1] = math::ptx_exp2(RS[fq][fk][k * 2 + 1] + negative_m);
+            RS[fq][fk][k * 2 + 4] = math::ptx_exp2(RS[fq][fk][k * 2 + 4] + negative_m);
+            RS[fq][fk][k * 2 + 5] = math::ptx_exp2(RS[fq][fk][k * 2 + 5] + negative_m);
+          }
+          else
+          {
+            RS[fq][fk][k * 2 + 0] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 0], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 1] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 1], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 4] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 4], sm_scale, negative_m));
+            RS[fq][fk][k * 2 + 5] = math::ptx_exp2(fmaf(RS[fq][fk][k * 2 + 5], sm_scale, negative_m));
+          }
+        }
+      }
+    }
+  }
+  return do_pv;
+}
 
 // for DTypeQKAccum float
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>

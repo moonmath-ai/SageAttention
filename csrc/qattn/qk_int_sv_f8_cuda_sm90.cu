@@ -256,8 +256,7 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       CTA_K);
 
   int p = 1;
-  for (uint32_t iter = 1; iter < num_iterations; iter++)
-  { 
+  for (uint32_t iter = 1; iter < num_iterations; iter++) { 
     p ^= 1;
 
     float dequant_scale = q_scale * K_scale[k_scale_idx + (iter - 1) * k_scale_advance_offset];
@@ -269,13 +268,11 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     // compute QK^T
     wgmma::warpgroup_arrive();
 #pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
       int8_t *sQ_local = sQ + fq * 64 * head_dim;
       wgmma::wgmma_s8s8s32<CTA_K, 0, head_dim>(RS[fq], sQ_local, sK);
 #pragma unroll
-      for (int k_it = 1; k_it < num_tiles_qk_inner; k_it++)
-      {
+      for (int k_it = 1; k_it < num_tiles_qk_inner; k_it++) {
         wgmma::wgmma_s8s8s32<CTA_K, 1, head_dim>(RS[fq], &sQ_local[k_it*32], &sK[k_it*32]);
       }
     }
@@ -305,59 +302,56 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
       }
     }
 
-    update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
-
-    // accumulate d on thread basis
-#pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-#pragma unrol
-      for (uint32_t fk = 0; fk < num_tiles_k; fk++)
-      {
-        d[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
-        d[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
-      }
-    }
+    bool do_pv = update_mdo_sm90<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false>(RS_f32, RO, m, d, sm_scale);
 
     uint32_t RS_f8[num_tiles_q][num_tiles_pv_inner][4];
-    RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+    if (do_pv) {
+      // accumulate d on thread basis
+#pragma unroll
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+#pragma unroll
+        for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
+          d[fq][0] += (RS_f32[fq][fk][0] + RS_f32[fq][fk][1] + RS_f32[fq][fk][4] + RS_f32[fq][fk][5]);
+          d[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
+        }
+      }
+
+      RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
+    }
 
     // wait for V
     wait(&barrier_V, p);
 
     float RO_temp[num_tiles_q][num_tiles_v][8];
     wgmma::warpgroup_arrive();
+    if (do_pv) {
 #pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
-      wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_temp[fq], RS_f8[fq][0], &sV[0]);
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_temp[fq], RS_f8[fq][0], &sV[0]);
 #pragma unroll
-      for (uint32_t v_it = 1; v_it < num_tiles_pv_inner; v_it++)
-      {
-        wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_temp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
+        for (uint32_t v_it = 1; v_it < num_tiles_pv_inner; v_it++) {
+          wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_temp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
+        }
       }
     }
-
     wgmma::warpgroup_commit_batch();
     wgmma::warpgroup_wait<0>();
-
+    
+    if (do_pv) {
 #pragma unroll
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++)
-    {
+      for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
-      for (uint32_t fv = 0; fv < num_tiles_v; fv++)
-      {
+        for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
 #pragma unroll
-        for (uint32_t k = 0; k < 8; k++)
-        {
-          RO[fq][fv][k] += RO_temp[fq][fv][k];
+          for (uint32_t k = 0; k < 8; k++) {
+            RO[fq][fv][k] += RO_temp[fq][fv][k];
+          }
         }
       }
     }
 
     // load V
-    if (threadIdx.x == 0)
-    {
+    if (threadIdx.x == 0) {
       expect_bytes<(CTA_K * head_dim) * sizeof(int8_t)>(&barrier_V);
       load_async_4D(sV, &tensorMapV, &barrier_V, iter * CTA_K, 0, kv_head_id, batch_id);
     }
