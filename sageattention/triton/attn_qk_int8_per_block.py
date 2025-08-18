@@ -24,15 +24,16 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     start_m,  
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
-                    t=None):
+                    t_idx=None):
     log = 0
     nof_kv_tiles = tl.cdiv(kv_len, BLOCK_N)
     qk_ratio = BLOCK_M // BLOCK_N
     j_bias = start_m * qk_ratio
-    pv_thr = -8 if t < 20 else -6 if t < 35 else -4
+    # pv_thr = -8 if t_idx < 10 else -6 if t_idx < 20 else -4
+    pv_thr = -1000
     for j_ in range(nof_kv_tiles):
-        # # linear indexing
-        # j = j_
+        # linear indexing
+        j = j_
 
         # # linear indexing starting at diag
         # j = (j_ + j_bias) % nof_kv_tiles
@@ -43,20 +44,20 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         # j_wo_bias = sign * mag
         # j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
 
-        # radial indexing with sink
-        if j_bias == 0:
-            sign = 2 * (j_ % 2) - 1
-            mag = (j_ + 1) // 2
-            j_wo_bias = sign * mag
-            j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
-        else:
-            if j_ < qk_ratio:
-                j = j_
-            else:
-                sign = 2 * (j_ % 2) - 1
-                mag = (j_ - qk_ratio + 1) // 2
-                j_wo_bias = sign * mag
-                j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
+        # # radial indexing with sink
+        # if j_bias == 0:
+        #     sign = 2 * (j_ % 2) - 1
+        #     mag = (j_ + 1) // 2
+        #     j_wo_bias = sign * mag
+        #     j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+        # else:
+        #     if j_ < qk_ratio:
+        #         j = j_
+        #     else:
+        #         sign = 2 * (j_ % 2) - 1
+        #         mag = (j_ - qk_ratio + 1) // 2
+        #         j_wo_bias = sign * mag
+        #         j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
 
         kv_start = j * BLOCK_N
         kv_stop = kv_len - kv_start
@@ -96,7 +97,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               BLOCK_N: tl.constexpr,  
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
-              log, t=None):
+              log, t_idx=None):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -125,7 +126,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
                                     start_m,  
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n,
-                                    t=t 
+                                    t_idx=t_idx 
                                     )
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
@@ -137,7 +138,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, t=None):
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, t_idx=None):
     log = torch.zeros(256, dtype=torch.int32, device='cuda')
 
     BLOCK_M = 128
@@ -186,7 +187,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
         STAGE=stage, RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4,
-        log=log, t=t)
+        log=log, t_idx=t_idx)
 
     print(f'{int(100*log.sum() / (kv_len / BLOCK_N) / (qo_len / BLOCK_M))}%', end=',')
     return o, lse
