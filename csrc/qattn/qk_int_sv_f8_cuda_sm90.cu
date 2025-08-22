@@ -315,7 +315,6 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
           d[fq][1] += (RS_f32[fq][fk][2] + RS_f32[fq][fk][3] + RS_f32[fq][fk][6] + RS_f32[fq][fk][7]);
         }
       }
-
       RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
     }
 
@@ -323,8 +322,9 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
     wait(&barrier_V, p);
 
     float RO_temp[num_tiles_q][num_tiles_v][8];
-    wgmma::warpgroup_arrive();
+
     if (do_pv) {
+      wgmma::warpgroup_arrive();
 #pragma unroll
       for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
         wgmma::wgmma_f8f8f32<head_dim, 0, CTA_K>(RO_temp[fq], RS_f8[fq][0], &sV[0]);
@@ -333,9 +333,11 @@ __global__ void qk_int8_sv_f8_attn_kernel(const __grid_constant__ CUtensorMap te
           wgmma::wgmma_f8f8f32<head_dim, 1, CTA_K>(RO_temp[fq], RS_f8[fq][v_it], &sV[v_it * 32]);
         }
       }
+      wgmma::warpgroup_commit_batch();
+      wgmma::warpgroup_wait<0>();
+    } else {
+      wgmma::warpgroup_wait<1>();
     }
-    wgmma::warpgroup_commit_batch();
-    wgmma::warpgroup_wait<0>();
     
     if (do_pv) {
 #pragma unroll

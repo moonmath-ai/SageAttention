@@ -19,60 +19,21 @@
 #include <cuda_fp16.h>
 #include <cuda_pipeline_primitives.h>
 #include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <cooperative_groups.h>
-#include <cub/cub.cuh>
-namespace cg = cooperative_groups;
 
 #include "../cp_async.cuh"
 #include "../mma.cuh"
 #include "../permuted_smem.cuh"
 #include "../numeric_conversion.cuh"
 
-__device__ inline float warp_max(float v) {
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  8));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  4));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  2));
-  v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  1));
-  return v;
+static constexpr float DO_PV_THRES = -7.0f;
+
+__device__ __forceinline__ bool warp_do_pv(float v) {
+  return __any_sync(0xffffffffu, v > DO_PV_THRES);
 }
 
-__device__ inline bool warpgroup_do_pv(float v) {
-  int lane = threadIdx.x & 31;
-  int warp = threadIdx.x >> 5;
-
-  float wmax = warp_max(v);
-
-  __shared__ bool do_pv[4];
-  if (lane == 0) {
-    do_pv[warp] = wmax > -7.0f;
-  }
-  __syncthreads();
-
-  return do_pv[0] || do_pv[1] || do_pv[2] || do_pv[3];
+__device__ __forceinline__ bool warpgroup_do_pv(float v) {
+  return __syncthreads_or(v > DO_PV_THRES);
 }
-
-__device__ inline float warpgroup128_max(float v) {
-  int lane = threadIdx.x & 31;
-  int warp = threadIdx.x >> 5;
-
-  float wmax = warp_max(v);
-
-  __shared__ float smem[4];
-  if (lane == 0) {
-    smem[warp] = wmax;
-  }
-  __syncthreads();
-
-  if (warp == 0 && lane == 0) {
-    smem[0] = max(max(smem[0], smem[1]), max(smem[2], smem[3]));
-  }
-  __syncthreads();
-
-  return smem[0];
-}
-
 
 #define WARP_SIZE 32
 
@@ -546,12 +507,7 @@ __device__ __forceinline__ bool update_mdo_sm89(float RS[][num_tiles_k][8], DTyp
     max(m_temp[0][0] - m[0][0], m_temp[0][1] - m[0][1]),
     max(m_temp[1][0] - m[1][0], m_temp[1][1] - m[1][1])
   );
-
-  m_max = warp_max(m_max);
-  bool do_pv = m_max > -4.0f;
-  // if (!do_pv) {
-  //   printf("blockIdx.x: %d, blockIdx.y: %d, blockIdx.z: %d, threadIdx.x: %d, threadIdx.y: %d, m_max: %f\n", blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, m_max);
-  // }
+  bool do_pv = warp_do_pv(m_max);
 
   if (do_pv) {
 #pragma unroll
