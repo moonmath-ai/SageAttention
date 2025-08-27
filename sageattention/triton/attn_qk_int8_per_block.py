@@ -21,68 +21,85 @@ import triton.language as tl
 @triton.jit
 def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
-                    start_m,  
+                    start_m, off_h,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
-                    t_idx=None):
+                    qk_skips=None, qk_skips_off=None, t_idx=None, b_idx=None, l_idx=None):
     log = 0
     nof_kv_tiles = tl.cdiv(kv_len, BLOCK_N)
     qk_ratio = BLOCK_M // BLOCK_N
     j_bias = start_m * qk_ratio
-    # pv_thr = -8 if t_idx < 10 else -6 if t_idx < 20 else -4
-    pv_thr = -1000
+
+    # j_low  =   0 if j_bias < 192 else 64 if j_bias < 320 else 192 if j_bias < 448 else 320
+    # j_high = 192 if j_bias < 64 else 320 if j_bias < 192 else 448 if j_bias < 320 else 512
+    j_low, j_high = 0, nof_kv_tiles
+
+    pv_thr = -8 if t_idx < 10 else -6 if t_idx < 20 else -4
+    # pv_thr = -8
+    # pv_thr = -math.inf  # disable skips
+
     for j_ in range(nof_kv_tiles):
-        # linear indexing
-        j = j_
+        if (j_ >= j_low and j_ < j_high) or j_ < 64:
+            qk_skips_off += j_
+            qk_skip = tl.load(qk_skips + qk_skips_off)
 
-        # # linear indexing starting at diag
-        # j = (j_ + j_bias) % nof_kv_tiles
+            log += qk_skip        
+            if qk_skip == 0:
+                # # linear indexing
+                # j = j_
 
-        # # radial indexing - starts at diag and alternates around it
-        # sign = 2 * (j_ % 2) - 1
-        # mag = (j_ + 1) // 2
-        # j_wo_bias = sign * mag
-        # j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+                # # linear indexing starting at diag
+                # j = (j_ + j_bias) % nof_kv_tiles
 
-        # # radial indexing with sink
-        # if j_bias == 0:
-        #     sign = 2 * (j_ % 2) - 1
-        #     mag = (j_ + 1) // 2
-        #     j_wo_bias = sign * mag
-        #     j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
-        # else:
-        #     if j_ < qk_ratio:
-        #         j = j_
-        #     else:
-        #         sign = 2 * (j_ % 2) - 1
-        #         mag = (j_ - qk_ratio + 1) // 2
-        #         j_wo_bias = sign * mag
-        #         j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
+                # radial indexing - starts at diag and alternates around it
+                sign = 2 * (j_ % 2) - 1
+                mag = (j_ + 1) // 2
+                j_wo_bias = sign * mag
+                j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
 
-        kv_start = j * BLOCK_N
-        kv_stop = kv_len - kv_start
-        k_scale = tl.load(K_scale_ptr + j)
-        k = tl.load(K_ptrs + kv_start * stride_kn, mask = offs_n[None, :] < kv_stop)
-        qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
-        
-        m_local = tl.max(qk, 1)
-        m_ij = tl.maximum(m_i, m_local)
-        do_pv = tl.max(m_local - m_ij) > pv_thr  # current p is far from zero (sparge condition)
-        log += 1 - do_pv
+                # # radial indexing with sink
+                # if j_bias == 0:
+                #     sign = 2 * (j_ % 2) - 1
+                #     mag = (j_ + 1) // 2
+                #     j_wo_bias = sign * mag
+                #     j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+                # else:
+                #     if j_ < qk_ratio:
+                #         j = j_
+                #     else:
+                #         sign = 2 * (j_ % 2) - 1
+                #         mag = (j_ - qk_ratio + 1) // 2
+                #         j_wo_bias = sign * mag
+                #         j = qk_ratio + (nof_kv_tiles + j_wo_bias + j_bias  - 2 * qk_ratio) % (nof_kv_tiles - qk_ratio)
 
-        if do_pv:
-            qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)
-            l_ij = tl.sum(p, 1)
-        
-            alpha = tl.math.exp2(m_i - m_ij)
-            m_i = m_ij
-            l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, None]
+                kv_start = j * BLOCK_N
+                kv_stop = kv_len - kv_start
+                k_scale = tl.load(K_scale_ptr + j)
+                k = tl.load(K_ptrs + kv_start * stride_kn, mask = offs_n[None, :] < kv_stop)
+                qk = tl.dot(q, k).to(tl.float32) * q_scale * k_scale
+                
+                m_local = tl.max(qk, 1)
+                m_ij = tl.maximum(m_i, m_local)
 
-            p = p.to(tl.float16)
-            v = tl.load(V_ptrs + kv_start * stride_vn, mask = offs_n[:, None] < kv_stop)
-            acc += tl.dot(p, v, out_dtype=tl.float16)  
+                pv_skip = tl.max(m_local - m_ij) <= pv_thr  # current p is far from zero (sparge condition)
+
+                # log += pv_skip
+                if pv_skip == 0:
+                    qk = qk - m_ij[:, None]
+                    p = tl.math.exp2(qk)
+                    l_ij = tl.sum(p, 1)
+                
+                    alpha = tl.math.exp2(m_i - m_ij)
+                    m_i = m_ij
+                    l_i = l_i * alpha + l_ij
+                    acc = acc * alpha[:, None]
+
+                    p = p.to(tl.float16)
+                    v = tl.load(V_ptrs + kv_start * stride_vn, mask = offs_n[:, None] < kv_stop)
+                    acc += tl.dot(p, v, out_dtype=tl.float16)
+                else:
+                    tl.store(qk_skips + qk_skips_off, 1) 
+
     return acc, l_i, m_i, log
 
 @triton.jit
@@ -97,7 +114,8 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               BLOCK_N: tl.constexpr,  
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
-              log, t_idx=None):
+              log, qk_skips=None, qk_skips_off=None, 
+              t_idx=None, b_idx=None, l_idx=None):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -122,25 +140,24 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
+    qk_skips_off += (off_h * tl.cdiv(qo_len, BLOCK_M) * tl.cdiv(kv_len, BLOCK_N)) + (start_m * tl.cdiv(kv_len, BLOCK_N))
     acc, l_i, m_i, log_inner = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                    start_m,  
+                                    start_m, off_h,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n,
-                                    t_idx=t_idx 
-                                    )
+                                    qk_skips=qk_skips, qk_skips_off=qk_skips_off, 
+                                    t_idx=t_idx, b_idx=b_idx, l_idx=l_idx)
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
-    tl.store(log + start_m, log_inner)
+    tl.store(log + off_h * 256 + start_m, log_inner)
 
     if RETURN_LSE:
         lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, t_idx=None):
-    log = torch.zeros(256, dtype=torch.int32, device='cuda')
-
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, qk_skips=None, idx=None):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -174,6 +191,9 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
     else:
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
+    log = torch.zeros(triton.cdiv(qo_len, BLOCK_M) * h_qo, dtype=torch.uint32, device='cuda')
+    #[1,30,12,256,512]
+    qk_skips_off = (idx['batch'] * 30 * h_qo * triton.cdiv(qo_len, BLOCK_M) * triton.cdiv(kv_len, BLOCK_N)) + (idx['layer'] * h_qo * triton.cdiv(qo_len, BLOCK_M) * triton.cdiv(kv_len, BLOCK_N))
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
     _attn_fwd[grid](
         q, k, v, q_scale, k_scale, o, lse,
@@ -187,10 +207,12 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
         STAGE=stage, RETURN_LSE=return_lse,
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4,
-        log=log, t_idx=t_idx)
-
-    print(f'{int(100*log.sum() / (kv_len / BLOCK_N) / (qo_len / BLOCK_M))}%', end=',')
-    return o, lse
+        log=log, qk_skips=qk_skips[0], qk_skips_off=qk_skips_off, 
+        t_idx=idx['time'], b_idx=idx['batch'], l_idx=idx['layer'])
+    skip_rate = log.sum() / triton.cdiv(kv_len, BLOCK_N) / triton.cdiv(qo_len, BLOCK_M)  / h_qo
+    # print(f'{int(100 * skip_rate)}%', end=',')
+    
+    return o, lse, qk_skips, skip_rate
 
 if __name__ == "__main__":
     print("hello world")
