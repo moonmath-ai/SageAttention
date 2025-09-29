@@ -83,6 +83,7 @@ def sageattn(
     return_lse: bool = False,
     qk_skips=None,
     idx=None,
+    qk_max=None,
     **kwargs: Any,
 ):
     """
@@ -138,7 +139,7 @@ def sageattn(
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
     """
-    return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, qk_skips=qk_skips, idx=idx)
+    return sageattn_qk_int8_pv_fp16_triton(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, qk_skips=qk_skips, idx=idx, qk_max=qk_max)
     arch = get_cuda_arch_versions()[q.device.index]
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
@@ -166,6 +167,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     return_lse: bool = False,
     qk_skips=None,
     idx=None,
+    qk_max=None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -289,14 +291,14 @@ def sageattn_qk_int8_pv_fp16_triton(
     if is_causal:
         o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
     else:
-        o, lse, qk_skips, skip_rate = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, qk_skips=qk_skips, idx=idx)
+        o, lse, qk_skips, skip_rate, qk_max = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse, qk_skips=qk_skips, idx=idx,qk_max_values=qk_max)
 
     o = o[..., :head_dim_og]
 
     if return_lse:
         return o, lse / 1.44269504 + lse_correction * sm_scale if smooth_k else lse / 1.44269504
     else:
-        return o, qk_skips, skip_rate
+        return o, qk_skips, skip_rate, qk_max
 
 @torch.compiler.disable
 def sageattn_varlen(

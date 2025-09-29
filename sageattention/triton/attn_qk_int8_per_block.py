@@ -24,7 +24,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     start_m, off_h,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
                     STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
-                    qk_skips=None, qk_skips_off=None, t_idx=None, b_idx=None, l_idx=None):
+                    qk_skips=None, qk_skips_off=None, t_idx=None, b_idx=None, l_idx=None, qk_max_values=None):
     log = 0
     nof_kv_tiles = tl.cdiv(kv_len, BLOCK_N)
     qk_ratio = BLOCK_M // BLOCK_N
@@ -40,22 +40,26 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
 
     for j_ in range(nof_kv_tiles):
         if (j_ >= j_low and j_ < j_high) or j_ < 64:
-            qk_skips_off += j_
-            qk_skip = tl.load(qk_skips + qk_skips_off)
-
+            # qk_skips_off += 1
+            qk_skip = tl.load(qk_skips + qk_skips_off+j_)
+            qk_max_off = (qk_skips_off+j_)*BLOCK_M 
             log += qk_skip        
+
+            # tl.store(qk_max_values + qk_skips_off+j_,1)
+            # tl.store(qk_skips + qk_skips_off, 1) 
+
             if qk_skip == 0:
                 # # linear indexing
-                # j = j_
+                j = j_
 
                 # # linear indexing starting at diag
                 # j = (j_ + j_bias) % nof_kv_tiles
 
                 # radial indexing - starts at diag and alternates around it
-                sign = 2 * (j_ % 2) - 1
-                mag = (j_ + 1) // 2
-                j_wo_bias = sign * mag
-                j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+                # sign = 2 * (j_ % 2) - 1
+                # mag = (j_ + 1) // 2
+                # j_wo_bias = sign * mag
+                # j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
 
                 # # radial indexing with sink
                 # if j_bias == 0:
@@ -82,6 +86,15 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                 m_ij = tl.maximum(m_i, m_local)
 
                 pv_skip = tl.max(m_local - m_ij) <= pv_thr  # current p is far from zero (sparge condition)
+                # tl.store(qk_max_values + qk_skips_off, tl.max(m_local))
+                # tl.store(qk_max_values + qk_skips_off,1)
+
+                tl.store(qk_max_values + qk_max_off + tl.arange(0, BLOCK_M), m_local.to(tl.int8))
+                # # Convert m_local to int8
+                # m_local_int8 = m_local.to(tl.int8)
+                # # Store each value individually
+                # for i in tl.static_range(BLOCK_M):  # This will be unrolled at compile time
+                #     tl.store(qk_max_values + qk_max_off + i, qk_skips_off)
 
                 # log += pv_skip
                 if pv_skip == 0:
@@ -97,8 +110,8 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                     p = p.to(tl.float16)
                     v = tl.load(V_ptrs + kv_start * stride_vn, mask = offs_n[:, None] < kv_stop)
                     acc += tl.dot(p, v, out_dtype=tl.float16)
-                else:
-                    tl.store(qk_skips + qk_skips_off, 1) 
+                # else:
+                #     tl.store(qk_skips + qk_skips_off+j_, 1) 
 
     return acc, l_i, m_i, log
 
@@ -115,7 +128,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
               STAGE: tl.constexpr,
               RETURN_LSE: tl.constexpr,
               log, qk_skips=None, qk_skips_off=None, 
-              t_idx=None, b_idx=None, l_idx=None):
+              t_idx=None, b_idx=None, l_idx=None, qk_max_values=None):
     start_m = tl.program_id(0)
 
     off_z = tl.program_id(2).to(tl.int64)
@@ -141,12 +154,13 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
     qk_skips_off += (off_h * tl.cdiv(qo_len, BLOCK_M) * tl.cdiv(kv_len, BLOCK_N)) + (start_m * tl.cdiv(kv_len, BLOCK_N))
+    # local_skips_off = qk_skips_off + (off_h * tl.cdiv(qo_len, BLOCK_M) * tl.cdiv(kv_len, BLOCK_N)) + (start_m * tl.cdiv(kv_len, BLOCK_N))
     acc, l_i, m_i, log_inner = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                     start_m, off_h,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n,
                                     qk_skips=qk_skips, qk_skips_off=qk_skips_off, 
-                                    t_idx=t_idx, b_idx=b_idx, l_idx=l_idx)
+                                    t_idx=t_idx, b_idx=b_idx, l_idx=l_idx, qk_max_values=qk_max_values)
     acc = acc / l_i[:, None]
     tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
 
@@ -157,7 +171,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, qk_skips=None, idx=None):
+def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.float16, return_lse=False, qk_skips=None, idx=None, qk_max_values=None):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -208,11 +222,11 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", output_dtype=torch.f
         num_warps=4 if head_dim == 64 else 8,
         num_stages=3 if head_dim == 64 else 4,
         log=log, qk_skips=qk_skips[0], qk_skips_off=qk_skips_off, 
-        t_idx=idx['time'], b_idx=idx['batch'], l_idx=idx['layer'])
+        t_idx=idx['time'], b_idx=idx['batch'], l_idx=idx['layer'], qk_max_values=qk_max_values[0])
     skip_rate = log.sum() / triton.cdiv(kv_len, BLOCK_N) / triton.cdiv(qo_len, BLOCK_M)  / h_qo
     # print(f'{int(100 * skip_rate)}%', end=',')
     
-    return o, lse, qk_skips, skip_rate
+    return o, lse, qk_skips, skip_rate, qk_max_values
 
 if __name__ == "__main__":
     print("hello world")
