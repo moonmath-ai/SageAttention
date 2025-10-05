@@ -42,7 +42,9 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
         if (j_ >= j_low and j_ < j_high) or j_ < 64:
             # qk_skips_off += 1
             qk_skip = tl.load(qk_skips + qk_skips_off+j_)
-            qk_max_off = (qk_skips_off+j_)*BLOCK_M 
+            # qk_max_off = (qk_skips_off+j_)*BLOCK_M 
+            qk_max_off = (qk_skips_off+j_)*1 
+
             log += qk_skip        
 
             # tl.store(qk_max_values + qk_skips_off+j_,1)
@@ -89,12 +91,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
                 # tl.store(qk_max_values + qk_skips_off, tl.max(m_local))
                 # tl.store(qk_max_values + qk_skips_off,1)
 
-                tl.store(qk_max_values + qk_max_off + tl.arange(0, BLOCK_M), m_local.to(tl.int8))
-                # # Convert m_local to int8
-                # m_local_int8 = m_local.to(tl.int8)
-                # # Store each value individually
-                # for i in tl.static_range(BLOCK_M):  # This will be unrolled at compile time
-                #     tl.store(qk_max_values + qk_max_off + i, qk_skips_off)
+                # tl.store(qk_max_values + qk_max_off + tl.arange(0, BLOCK_M), m_local.to(tl.int8))
+                tl.store(qk_max_values + qk_max_off, tl.mean(m_local).to(tl.int8))
+
+
 
                 # log += pv_skip
                 if pv_skip == 0:
