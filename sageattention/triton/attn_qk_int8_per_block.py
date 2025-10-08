@@ -49,17 +49,17 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, kv_len,
             # tl.store(qk_skips + qk_skips_off, 1) 
 
             if qk_skip == 0:
-                # # # linear indexing
-                # j = j_
+                # # linear indexing
+                j = j_
 
                 # # linear indexing starting at diag
                 # j = (j_ + j_bias) % nof_kv_tiles
 
                 # radial indexing - starts at diag and alternates around it
-                sign = 2 * (j_ % 2) - 1
-                mag = (j_ + 1) // 2
-                j_wo_bias = sign * mag
-                j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
+                # sign = 2 * (j_ % 2) - 1
+                # mag = (j_ + 1) // 2
+                # j_wo_bias = sign * mag
+                # j = (nof_kv_tiles + j_wo_bias + j_bias) % nof_kv_tiles
 
                 # # radial indexing with sink
                 # if j_bias == 0:
